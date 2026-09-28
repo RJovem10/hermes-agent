@@ -27,6 +27,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
+from agent import post_write_validation as post_write
 
 logger = logging.getLogger(__name__)
 
@@ -1167,6 +1168,8 @@ def _run_review_in_thread(
     review_agent = None
     review_messages: List[Dict] = []
     review_usage: Dict[str, Any] = {}
+    gate_state = None
+    gate_results: list[post_write.GateResult] = []
 
     def _unregister_review_agent(agent_ref) -> None:
         """Idempotent: clears the review fork from both tracking slots.
@@ -1537,15 +1540,36 @@ def _run_review_in_thread(
                         _digest_history(messages_snapshot) if _routed
                         else messages_snapshot
                     )
-                    review_agent.run_conversation(
-                        user_message=(
-                            prompt
-                            + "\n\nYou can only call memory and skill "
-                            "management tools. Other tools will be denied "
-                            "at runtime — do not attempt them."
-                        ),
-                        conversation_history=_review_history,
-                    )
+                    try:
+                        with post_write.acquire_operation_fence():
+                            operation = post_write.begin_operation(
+                                "background_review",
+                                session_id=(review_agent.session_id
+                                            if isinstance(review_agent.session_id, str) else None),
+                            )
+                            try:
+                                review_agent.run_conversation(
+                                    user_message=(
+                                        prompt
+                                        + "\n\nYou can only call memory and skill "
+                                        "management tools. Other tools will be denied "
+                                        "at runtime — do not attempt them."
+                                    ),
+                                    conversation_history=_review_history,
+                                )
+                            except BaseException as exc:
+                                gate_state = post_write.finish_operation(
+                                    operation, interrupted=isinstance(exc, (KeyboardInterrupt, SystemExit)),
+                                    failure=str(exc) or type(exc).__name__,
+                                )
+                                gate_results = operation.results
+                                raise
+                            else:
+                                gate_state = post_write.finish_operation(operation)
+                                gate_results = operation.results
+                    except post_write.FenceBusy:
+                        gate_state = "DEFERRED"
+                        logger.info("background review deferred: self-improvement operation fence busy")
             finally:
                 clear_thread_tool_whitelist()
                 # Attribute the review fork's usage to the PARENT session.
@@ -1613,8 +1637,40 @@ def _run_review_in_thread(
             review_usage, _classify_review_result(actions)
         )
 
-        if actions:
+        if gate_state == "DEFERRED":
+            logger.info("background review made no autonomous writes: fence busy")
+            message = "Self-improvement review deferred: operation fence busy"
+            agent._safe_print(f"  💾 {message}")
+            _bg_cb = agent.background_review_callback
+            if _bg_cb:
+                try:
+                    _bg_cb(message)
+                except Exception:
+                    pass
+        elif gate_state in (
+            post_write.GateState.FINDINGS,
+            post_write.GateState.OPERATIONAL_ERROR,
+            post_write.GateState.INTERRUPTED,
+        ):
+            detail = "; ".join(
+                f"{result.validator_name or 'gate'}: {result.reason or result.state.value}"
+                + (f" ({result.artifact_path})" if result.artifact_path else "")
+                for result in gate_results
+            )
+            message = f"Self-improvement review validation {gate_state.value}: {detail}"
+            agent._safe_print(f"  💾 {message}")
+            _bg_cb = agent.background_review_callback
+            if _bg_cb:
+                try:
+                    _bg_cb(message)
+                except Exception:
+                    pass
+        elif actions:
             summary = " · ".join(dict.fromkeys(actions))
+            if gate_state == post_write.GateState.PASS:
+                summary += " · validation passed"
+            elif gate_state == post_write.GateState.NOT_APPLICABLE:
+                summary += " · validation not applicable"
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )

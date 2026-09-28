@@ -2251,6 +2251,9 @@ DEFAULT_CONFIG = {
         "ledger": True,
     },
 
+    # Explicitly opted-in post-write validators for autonomous skill writes.
+    "post_write_validators": {},
+
     # Curator — background skill maintenance.
     #
     # Periodically reviews AGENT-CREATED skills (never bundled or

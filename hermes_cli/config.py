@@ -5325,6 +5325,7 @@ def _default_value_for_key(dotted_key: str):
 # without deep checking, so users can set e.g. ``mcp_servers.my-server.command``
 # or ``providers.openrouter.api_key`` without us needing to know server names.
 _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
+    "post_write_validators",
     "providers",
     "credential_pool_strategies",
     "mcp_servers",

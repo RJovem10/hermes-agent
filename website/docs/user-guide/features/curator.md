@@ -59,6 +59,63 @@ curator:
 
 To disable entirely, set `curator.enabled: false`. To keep the always-on pruning but opt into LLM consolidation, set `curator.consolidate: true`.
 
+### Post-write validation for autonomous skill changes
+
+The curator and the turn-end background review share a bounded, cross-process
+`skills/.locks/self-improvement.fence`. An operation that cannot acquire it is
+deferred before it writes or creates/prunes a curator backup. The curator records
+`PENDING` before its backup starts. A dry run does not acquire the fence or run validators.
+Foreground `skill_manage` writes do not take this fence, so they remain available
+during a background operation.
+
+Validators are explicitly opted into in the operator's trusted `config.yaml`:
+
+```yaml
+post_write_validators:
+  skill-check:
+    enabled: true
+    paths: [skills/example]
+    command: [/absolute/path/to/skill-check, --json]
+    timeout: 60
+    stability_paths: [skills/example]
+```
+
+`paths` select a validator when a changed path is at or below one of the listed
+HERMES_HOME-relative roots. Optional `stability_paths` are independently hashed
+before and after the validator; configure only existing roots that must remain stable.
+Each configured root must be a scannable real directory or ordinary file;
+symlink roots and incomplete scans cause an operational error.
+Neither list is passed as command arguments. The command is an argv list with
+an absolute executable, launched unattended with `shell=False`, closed stdin,
+and a hard timeout (clamped to 1–600 seconds). It must write a JSON object to
+stdout. Exit 0 means `PASS`, 1 means `FINDINGS`, and 2 or greater means
+`OPERATIONAL_ERROR`; its JSON status, if present, must agree with the exit code.
+Warnings alone do not change the command's verdict.
+
+The sidecar `skills/.post_write_validation_state.json` records `PENDING` before
+autonomous writes and normally a terminal `PASS`, `FINDINGS`, `OPERATIONAL_ERROR`,
+`INTERRUPTED`, or `NOT_APPLICABLE` state before the fence is released. A prior
+`PENDING` record is recovered as interrupted when the next operation acquires
+the free fence. Validator output is retained under
+`logs/post-write-validation/`, outside the skill corpus. Findings and errors do
+not roll back writes or trigger automatic correction. A concurrent foreground
+change under `stability_paths` produces `INTERRUPTED`, invalidating the verdict.
+The artifact retains the validator's original verdict separately from the final
+gate verdict. If terminal sidecar persistence fails, the prior `PENDING` record
+remains and the operation reports an error. The curator's `.curator_state` is a
+status mirror; the sidecar is authoritative and can repair a stale mirror.
+Each validator runs once per write set; findings and interruptions are not
+retried automatically.
+`NOT_APPLICABLE` means no validator matched or reliable changed-path evidence
+was unavailable; it never means a validator passed.
+
+Changed-path detection uses an ID high-water mark in the append-only skill
+ledger. The gate reads every post-cursor row strictly: malformed, unreadable,
+or missing-cursor evidence cannot yield `PASS`. A foreground or unattributed
+mutation within that window yields `INTERRUPTED`. The ledger remains telemetry,
+not a blocking write gate. This configuration does not install or enable a
+validator by itself; profile-specific validator deployment is separate.
+
 ### Running the review on a cheaper aux model
 
 The curator's LLM review pass is a regular auxiliary task slot — `auxiliary.curator` — alongside Vision, Compression, Session Search, etc. "Auto" means "use my main chat model"; override the slot to pin a specific provider + model for the review pass instead.
