@@ -20,6 +20,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -51,6 +53,12 @@ def _fake_parent(client, *, runtime=None) -> SimpleNamespace:
         _emit_auxiliary_failure=lambda *_a, **_k: None,
         _safe_print=lambda *_a, **_k: None,
         background_review_callback=None,
+        _memory_store=None,
+        _memory_enabled=False,
+        _user_profile_enabled=False,
+        _cached_system_prompt="",
+        session_start=None,
+        memory_notifications="on",
     )
 
 
@@ -115,3 +123,85 @@ def test_an_incapable_provider_still_reviews_when_the_review_is_routed_away():
     }
     with patch.object(bg, "_resolve_review_runtime", return_value=routed):
         assert _run(_fake_parent(_IncapableClient())).called
+
+
+def test_busy_fence_defers_review_before_fork_writes():
+    from agent import post_write_validation as gate
+
+    parent = _fake_parent(MagicMock())
+    with (
+        gate.acquire_operation_fence(),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.AIAgent") as mock_aiagent,
+        patch("tools.terminal_tool.set_approval_callback"),
+    ):
+        bg._run_review_in_thread(parent, [], "review")
+        mock_aiagent.return_value.run_conversation.assert_not_called()
+        assert not gate.gate_state_path().exists()
+
+
+def test_background_review_gate_controls_completion_message():
+    from agent import post_write_validation as gate
+
+    for state in (gate.GateState.PASS, gate.GateState.FINDINGS,
+                  gate.GateState.OPERATIONAL_ERROR, gate.GateState.INTERRUPTED):
+        parent = _fake_parent(MagicMock())
+        messages = []
+        parent.background_review_callback = messages.append
+        parent._safe_print = messages.append
+        result = gate.GateResult("check", state, "operation", reason="test-result")
+        def review_write(_agent, _snapshot, _prompt, _task_cfg, _review_run, st, _memory, _explicit):
+            assert gate.gate_state_path().exists()
+            assert "PENDING" in gate.gate_state_path().read_text()
+            with pytest.raises(gate.FenceBusy):
+                with gate.acquire_operation_fence(timeout=0):
+                    pass
+            st.review_session_id = "fork-session"
+        with (
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch("tools.terminal_tool.set_approval_callback"),
+            patch.object(bg, "_run_review_fork", side_effect=review_write),
+            patch.object(bg, "summarize_background_review_actions", return_value=["Skill updated"]),
+            patch.object(gate, "changed_paths_since", return_value={"skills/sample/SKILL.md"}),
+            patch.object(gate, "run_applicable_validators", return_value=[result]),
+        ):
+            bg._run_review_in_thread(parent, [], "review")
+        assert gate.gate_state_path().exists()
+        assert state.value in gate.gate_state_path().read_text()
+        if state == gate.GateState.PASS:
+            assert any("Skill updated" in message for message in messages)
+        else:
+            assert not any("Self-improvement review: Skill updated" in message for message in messages)
+            assert any(f"validation {state.value}" in message for message in messages)
+
+
+def test_background_terminal_write_failure_keeps_pending_and_suppresses_success(tmp_path, monkeypatch):
+    import json
+    from agent import post_write_validation as gate
+
+    home = tmp_path / "profile"
+    (home / "skills").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    parent = _fake_parent(MagicMock())
+    messages = []
+    parent._safe_print = messages.append
+    parent.background_review_callback = messages.append
+    original = gate.record_gate_state
+    def fail_terminal(*args, **kwargs):
+        if args[2] != gate.GateState.PENDING:
+            raise OSError("terminal write failed")
+        return original(*args, **kwargs)
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("tools.terminal_tool.set_approval_callback"),
+        patch.object(bg, "_run_review_fork"),
+        patch.object(bg, "summarize_background_review_actions", return_value=["Skill updated"]),
+        patch.object(gate, "record_gate_state", side_effect=fail_terminal),
+    ):
+        bg._run_review_in_thread(parent, [], "review")
+    assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+    assert not (home / "skills/.curator_state").exists()
+    assert any("validation OPERATIONAL_ERROR" in message for message in messages)
+    assert not any("Self-improvement review: Skill updated" in message for message in messages)
+    with gate.acquire_operation_fence(timeout=0):
+        pass

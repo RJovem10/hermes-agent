@@ -576,6 +576,268 @@ def test_run_review_records_state(curator_env):
     assert state["last_run_summary"] is not None
 
 
+def test_curator_fence_precedes_transitions_and_profile_reaches_worker(curator_env, monkeypatch):
+    import json
+    from hermes_constants import (get_hermes_home, reset_hermes_home_override,
+                                  set_hermes_home_override)
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    profile = curator_env["home"].parent / "second-profile"
+    (profile / "skills/sample").mkdir(parents=True)
+    (profile / "skills/sample/SKILL.md").write_text("before")
+    monkeypatch.setattr("agent.curator_backup.snapshot_skills", lambda **_: None)
+    monkeypatch.setattr(c, "_render_candidate_list", lambda: "one candidate")
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "post_write_validators": {"check": {
+            "enabled": True, "paths": ["skills/sample"],
+            "command": ["/usr/bin/env", "python3", "-c",
+                        "import json,os; "
+                        f"assert os.environ['HERMES_HOME'] == {str(profile)!r}; "
+                        "print(json.dumps({'status': 'pass'}))"],
+            "timeout": 10,
+        }},
+    })
+    observed = []
+
+    def transitions(now):
+        observed.append(("transitions", get_hermes_home()))
+        assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+        with pytest.raises(gate.FenceBusy):
+            with gate.acquire_operation_fence(timeout=0):
+                pass
+        return {"checked": 1, "marked_stale": 0, "archived": 0,
+                "reactivated": 0, "seeded": 0}
+
+    def fork(_prompt):
+        observed.append(("fork", get_hermes_home()))
+        assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+        target = profile / "skills/sample/SKILL.md"
+        target.write_text("after")
+        entry = {
+            "id": "after-cursor", "ts": datetime.now(timezone.utc).isoformat(),
+            "actor": "curator", "action": "patch", "skill": "sample",
+            "evidence": {"session_id": "fork-session"},
+            "before": [{"path": str(target)}], "after": [{"path": str(target)}],
+        }
+        with (profile / "skills/.curator_ledger.jsonl").open("a") as stream:
+            stream.write(json.dumps(entry) + "\n")
+        return {"final": "done", "summary": "done", "model": "", "provider": "",
+                "tool_calls": [], "error": None, "session_id": "fork-session"}
+
+    monkeypatch.setattr(c, "apply_automatic_transitions", transitions)
+    monkeypatch.setattr(c, "_run_llm_review", fork)
+    token = set_hermes_home_override(profile)
+    try:
+        summaries = []
+        c.run_curator_review(on_summary=summaries.append, synchronous=False, consolidate=True)
+        for worker in threading.enumerate():
+            if worker.name == "curator-review":
+                worker.join(timeout=10)
+        assert observed == [("transitions", profile), ("fork", profile)]
+        assert c.load_state()["last_gate_state"] == "PASS"
+        assert any("validation passed" in summary for summary in summaries)
+        assert json.loads(gate.gate_state_path().read_text())["state"] == "PASS"
+        with gate.acquire_operation_fence(timeout=0):
+            pass
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_busy_fence_prevents_curator_backup_and_pruning(curator_env, monkeypatch):
+    from agent import post_write_validation as gate
+    from agent import curator_backup
+
+    c = curator_env["curator"]
+    monkeypatch.setattr(curator_backup, "is_enabled", lambda: True)
+    monkeypatch.setattr(curator_backup, "snapshot_skills",
+                        lambda **_kwargs: pytest.fail("snapshot or pruning ran"))
+    monkeypatch.setattr(curator_backup, "prune_old_snapshots",
+                        lambda: pytest.fail("backup pruning ran"))
+    monkeypatch.setattr(c, "apply_automatic_transitions",
+                        lambda **_kwargs: pytest.fail("transitions ran"))
+    acquire = gate.acquire_operation_fence
+    with acquire():
+        monkeypatch.setattr(gate, "acquire_operation_fence", lambda: acquire(timeout=0))
+        result = c.run_curator_review(synchronous=True)
+        assert result["deferred"] == "self-improvement fence busy"
+        assert not gate.gate_state_path().exists()
+
+
+@pytest.mark.parametrize(("consolidate", "expected"), [(True, "snapshot"), (False, "prune")])
+def test_curator_backup_work_starts_after_pending_under_fence(
+    curator_env, monkeypatch, consolidate, expected,
+):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    observed = []
+    def snapshot(**_kwargs):
+        assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+        with pytest.raises(gate.FenceBusy):
+            with gate.acquire_operation_fence(timeout=0):
+                pass
+        observed.append("snapshot")
+        return None
+    def prune():
+        assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+        with pytest.raises(gate.FenceBusy):
+            with gate.acquire_operation_fence(timeout=0):
+                pass
+        observed.append("prune")
+    monkeypatch.setattr("agent.curator_backup.snapshot_skills", snapshot)
+    monkeypatch.setattr("agent.curator_backup.prune_old_snapshots", prune)
+    monkeypatch.setattr(c, "apply_automatic_transitions", lambda **_: {
+        "checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0,
+    })
+    c.run_curator_review(synchronous=True, consolidate=consolidate)
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize("failure_point", ["transitions", "worker_setup"])
+def test_curator_exception_after_pending_releases_fence(curator_env, monkeypatch, failure_point):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    monkeypatch.setattr("agent.curator_backup.snapshot_skills", lambda **_: None)
+    if failure_point == "transitions":
+        def transitions(**_kwargs):
+            assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+            raise RuntimeError("transition failed")
+        monkeypatch.setattr(c, "apply_automatic_transitions", transitions)
+    else:
+        monkeypatch.setattr(c, "apply_automatic_transitions", lambda **_: {
+            "checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0,
+        })
+        monkeypatch.setattr("tools.thread_context.propagate_context_to_thread",
+                            lambda *_: (_ for _ in ()).throw(RuntimeError("worker setup failed")))
+    messages = []
+    with pytest.raises(RuntimeError):
+        c.run_curator_review(on_summary=messages.append, synchronous=False)
+    assert json.loads(gate.gate_state_path().read_text())["state"] == "OPERATIONAL_ERROR"
+    assert c.load_state()["last_gate_state"] == "OPERATIONAL_ERROR"
+    assert not any("validation passed" in message for message in messages)
+    with gate.acquire_operation_fence(timeout=0):
+        pass
+
+
+def test_curator_terminal_persistence_failure_keeps_pending(curator_env, monkeypatch):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    monkeypatch.setattr("agent.curator_backup.snapshot_skills", lambda **_: None)
+    original = gate.record_gate_state
+    def fail_terminal(*args, **kwargs):
+        if args[2] != gate.GateState.PENDING:
+            raise OSError("terminal write failed")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(gate, "record_gate_state", fail_terminal)
+    messages = []
+    c.run_curator_review(on_summary=messages.append, synchronous=True, consolidate=False)
+    assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+    state = c.load_state()
+    assert state["last_gate_state"] == "PENDING"
+    assert any("validation OPERATIONAL_ERROR" in message for message in messages)
+    assert not any("validation passed" in message for message in messages)
+    with gate.acquire_operation_fence(timeout=0):
+        pass
+
+
+def test_curator_fork_error_after_transitions_is_not_success(curator_env, monkeypatch):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    monkeypatch.setattr("agent.curator_backup.snapshot_skills", lambda **_: None)
+    monkeypatch.setattr(c, "apply_automatic_transitions", lambda **_: {
+        "checked": 1, "marked_stale": 0, "archived": 0, "reactivated": 0,
+    })
+    monkeypatch.setattr(c, "_render_candidate_list", lambda: "one candidate")
+    def fail_fork(_prompt):
+        assert json.loads(gate.gate_state_path().read_text())["state"] == "PENDING"
+        raise RuntimeError("fork failed")
+    monkeypatch.setattr(c, "_run_llm_review", fail_fork)
+    messages = []
+    c.run_curator_review(on_summary=messages.append, synchronous=True, consolidate=True)
+    assert json.loads(gate.gate_state_path().read_text())["state"] == "OPERATIONAL_ERROR"
+    assert c.load_state()["last_gate_state"] == "OPERATIONAL_ERROR"
+    assert not any("validation passed" in message for message in messages)
+    with gate.acquire_operation_fence(timeout=0):
+        pass
+
+
+@pytest.mark.parametrize("terminal", ["PASS", "FINDINGS", "OPERATIONAL_ERROR", "INTERRUPTED"])
+def test_curator_mirror_recovers_from_authoritative_sidecar(curator_env, terminal):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    home = curator_env["home"]
+    mirror = c._default_state()
+    mirror.update(last_gate_operation_id="current", last_gate_started_at="2026-01-01T00:00:00+00:00",
+                  last_gate_state="PENDING", last_run_summary="auto: changed; validation pending")
+    (home / "skills/.curator_state").write_text(json.dumps(mirror))
+    sidecar = {
+        "operation_id": "current", "operation_kind": "curator", "state": terminal,
+        "started_at": mirror["last_gate_started_at"], "completed_at": "2026-01-01T00:01:00+00:00",
+        "results": [{"validator_name": "check", "state": terminal}],
+    }
+    gate.gate_state_path().write_text(json.dumps(sidecar))
+    observed = c.load_state()
+    assert observed["last_gate_state"] == terminal
+    assert observed["last_gate_result"][0]["validator"] == "check"
+    assert observed["last_gate_result"][0]["state"] == terminal
+    assert "validation pending" not in observed["last_run_summary"]
+    mirror["last_gate_state"] = terminal
+    mirror["last_gate_result"] = None
+    (home / "skills/.curator_state").write_text(json.dumps(mirror))
+    assert c.load_state()["last_gate_result"][0]["state"] == terminal
+
+
+def test_curator_mirror_keeps_unrelated_newer_operation(curator_env):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    home = curator_env["home"]
+    mirror = c._default_state()
+    mirror.update(last_gate_operation_id="newer", last_gate_started_at="2026-02-01T00:00:00+00:00",
+                  last_gate_state="FINDINGS")
+    (home / "skills/.curator_state").write_text(json.dumps(mirror))
+    gate.gate_state_path().write_text(json.dumps({
+        "operation_id": "older", "operation_kind": "curator", "state": "PASS",
+        "started_at": "2026-01-01T00:00:00+00:00", "results": [],
+    }))
+    assert c.load_state()["last_gate_operation_id"] == "newer"
+    assert c.load_state()["last_gate_state"] == "FINDINGS"
+    mirror["last_gate_started_at"] = None
+    (home / "skills/.curator_state").write_text(json.dumps(mirror))
+    assert c.load_state()["last_gate_operation_id"] == "newer"
+
+
+def test_background_sidecar_preserves_last_curator_for_reconciliation(curator_env):
+    import json
+    from agent import post_write_validation as gate
+
+    c = curator_env["curator"]
+    home = curator_env["home"]
+    mirror = c._default_state()
+    mirror.update(last_gate_operation_id="curator-op", last_gate_started_at="2026-01-01T00:00:00+00:00",
+                  last_gate_state="PENDING", last_run_summary="auto: changed; validation pending")
+    (home / "skills/.curator_state").write_text(json.dumps(mirror))
+    gate.record_gate_state("curator-op", "curator", gate.GateState.PASS,
+                           started_at=mirror["last_gate_started_at"])
+    gate.record_gate_state("background-op", "background_review", gate.GateState.PENDING,
+                           started_at="2026-01-02T00:00:00+00:00")
+    gate.record_gate_state("background-op", "background_review", gate.GateState.NOT_APPLICABLE,
+                           started_at="2026-01-02T00:00:00+00:00")
+    assert c.load_state()["last_gate_state"] == "PASS"
+    assert c.load_state()["last_gate_operation_id"] == "curator-op"
+
+
 
 
 def test_dry_run_injects_report_only_banner(curator_env, monkeypatch):

@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
 from agent.thread_scoped_output import thread_scoped_silence
+from agent import post_write_validation as post_write
 
 logger = logging.getLogger(__name__)
 
@@ -1130,6 +1131,7 @@ class _ReviewForkState:
     review_agent: Any = None
     review_messages: List[Dict] = field(default_factory=list)
     review_usage: Dict[str, Any] = field(default_factory=dict)
+    review_session_id: Optional[str] = None
 
 
 def _release_fork_clients(review_agent: Any) -> None:
@@ -1151,6 +1153,10 @@ def _run_review_fork(
     attended, so the unattended-only memory delete gate leaves the full operation set available."""
     st.review_agent, _rt, _routed = build_cache_parity_fork(
         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
+    st.review_session_id = (
+        getattr(st.review_agent, "session_id", None)
+        if isinstance(getattr(st.review_agent, "session_id", None), str) else None
+    )
     st.review_agent._review_attended = explicit
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
@@ -1240,6 +1246,8 @@ def _run_review_in_thread(
         _set_thread_approval_callback(None)
         return
     st = _ReviewForkState()
+    gate_state = None
+    gate_results: List[post_write.GateResult] = []
     try:
         # Silence stdout/stderr for THIS thread only: a process-global redirect would blank every
         # other thread's console for the whole review.
@@ -1249,7 +1257,28 @@ def _run_review_in_thread(
         # their console output (#55769 / #55925). ``thread_scoped_silence`` routes only this thread's writes
         # to devnull and leaves all other threads on the real streams.
         with thread_scoped_silence():
-            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit)
+            try:
+                with post_write.acquire_operation_fence():
+                    operation = post_write.begin_operation("background_review")
+                    try:
+                        _run_review_fork(
+                            agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit,
+                        )
+                    except BaseException as exc:
+                        operation.session_id = st.review_session_id
+                        gate_state = post_write.finish_operation(
+                            operation, interrupted=isinstance(exc, (KeyboardInterrupt, SystemExit)),
+                            failure=str(exc) or type(exc).__name__,
+                        )
+                        gate_results = operation.results
+                        raise
+                    else:
+                        operation.session_id = st.review_session_id
+                        gate_state = post_write.finish_operation(operation)
+                        gate_results = operation.results
+            except post_write.FenceBusy:
+                gate_state = "DEFERRED"
+                logger.info("background review deferred: self-improvement operation fence busy")
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
         try:
@@ -1275,7 +1304,29 @@ def _run_review_in_thread(
             )
             actions = []
         _log_review_completion(st.review_usage, _classify_review_result(actions))
-        if actions:
+        if gate_state == "DEFERRED":
+            message = "Self-improvement review deferred: operation fence busy"
+            agent._safe_print(f"  💾 {message}")
+            if agent.background_review_callback:
+                with suppress(Exception):
+                    agent.background_review_callback(message)
+        elif gate_state in (post_write.GateState.FINDINGS, post_write.GateState.OPERATIONAL_ERROR,
+                            post_write.GateState.INTERRUPTED):
+            detail = "; ".join(
+                f"{result.validator_name or 'gate'}: {result.reason or result.state.value}"
+                + (f" ({result.artifact_path})" if result.artifact_path else "")
+                for result in gate_results
+            )
+            message = f"Self-improvement review validation {gate_state.value}: {detail}"
+            agent._safe_print(f"  💾 {message}")
+            if agent.background_review_callback:
+                with suppress(Exception):
+                    agent.background_review_callback(message)
+        elif actions:
+            if gate_state == post_write.GateState.PASS:
+                actions.append("validation passed")
+            elif gate_state == post_write.GateState.NOT_APPLICABLE:
+                actions.append("validation not applicable")
             _publish_review_summary(agent, actions)
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)

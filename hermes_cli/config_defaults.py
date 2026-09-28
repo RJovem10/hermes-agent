@@ -1497,6 +1497,9 @@ DEFAULT_CONFIG = {
             "keep": 2,  # retain last N regular snapshots
         },
     },
+    # Operator-defined, opt-in validators for autonomous skill writes. Names
+    # and per-validator fields are validated by agent.post_write_validation.
+    "post_write_validators": {},
     # Honcho AI-native memory — ~/.honcho/config.json is the source of truth (apiKey, workspace,
     # peerName, sessions, enabled); hermes-specific overrides only here.
     "honcho": {},

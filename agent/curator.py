@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 from hermes_constants import get_hermes_home
+from agent import post_write_validation as post_write
 from agent.skill_utils import get_disabled_skill_names
 from tools import skill_usage
 from utils import atomic_json_write
@@ -40,20 +41,69 @@ def _state_file() -> Path:
     return get_hermes_home() / "skills" / ".curator_state"
 
 
-def load_state() -> Dict[str, Any]:
-    base: Dict[str, Any] = {
+def _default_state() -> Dict[str, Any]:
+    return {
         "last_run_at": None, "last_run_duration_seconds": None, "last_run_summary": None,
         "last_run_summary_shown_at": None, "last_report_path": None, "paused": False, "run_count": 0,
+        "last_gate_state": None, "last_gate_operation_id": None,
+        "last_gate_started_at": None, "last_gate_completed_at": None, "last_gate_result": None,
     }
+
+
+def _reconcile_gate_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The sidecar is authoritative; repair only the matching or older curator mirror."""
+    try:
+        sidecar = json.loads(post_write.gate_state_path().read_text(encoding="utf-8"))
+        record = sidecar if sidecar.get("operation_kind") == "curator" else sidecar.get("last_curator")
+        if not isinstance(record, dict) or record.get("operation_kind") != "curator":
+            return state
+        operation_id, started_at, gate_state = (
+            record.get("operation_id"), record.get("started_at"), record.get("state"),
+        )
+        if not all(isinstance(value, str) and value for value in (operation_id, started_at, gate_state)):
+            return state
+        mirror_id = state.get("last_gate_operation_id")
+        mirror_started = state.get("last_gate_started_at")
+        if mirror_id and mirror_id != operation_id and (
+            not isinstance(mirror_started, str) or mirror_started >= started_at
+        ):
+            return state
+        if (mirror_id == operation_id and state.get("last_gate_state") == gate_state
+                and state.get("last_gate_result") is not None
+                and "; validation pending" not in (state.get("last_run_summary") or "")):
+            return state
+        state.update(
+            last_gate_operation_id=operation_id, last_gate_started_at=started_at,
+            last_gate_completed_at=record.get("completed_at"), last_gate_state=gate_state,
+            last_gate_result=[{
+                "validator": result.get("validator_name"), "state": result.get("state"),
+                "reason": result.get("reason"), "artifact_path": result.get("artifact_path"),
+                "validator_state": result.get("validator_state"),
+                "validator_reason": result.get("validator_reason"),
+                "validator_exit_code": result.get("validator_exit_code"),
+            } for result in (record.get("results") or []) if isinstance(result, dict)],
+        )
+        summary = (state.get("last_run_summary") or "").replace("; validation pending", "")
+        verdict = ("validation passed" if gate_state == post_write.GateState.PASS.value else
+                   "validation not applicable" if gate_state == post_write.GateState.NOT_APPLICABLE.value else
+                   f"validation {gate_state}")
+        state["last_run_summary"] = f"{summary}; {verdict}" if summary else verdict
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return state
+
+
+def load_state() -> Dict[str, Any]:
+    base = _default_state()
     path = _state_file()
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("Failed to read curator state: %s", e)
-        return base
+        return _reconcile_gate_state(base)
     if isinstance(data, dict):
         base.update({k: v for k, v in data.items() if k in base or k.startswith("_")})
-    return base
+    return _reconcile_gate_state(base)
 
 
 def save_state(data: Dict[str, Any]) -> None:
@@ -923,68 +973,139 @@ def run_curator_review(
     recorded in ``state.last_report_path`` so users can read what WOULD have happened."""
     consolidate = get_consolidate() if consolidate is None else consolidate
     start = datetime.now(timezone.utc)
-    if dry_run:  # count candidates without mutating state
-        counts = {"checked": len(_safe_curated_report()), "marked_stale": 0, "archived": 0, "reactivated": 0}
-    else:
-        from agent import curator_backup
-        # The prune-only pass just renames directories into .archive/ (its own undo) and every edit is
-        # ledgered; only the LLM consolidation pass rewrites content in place, so only it earns a
-        # whole-tree snapshot. Retention still runs so old snapshots age out either way.
-        if consolidate:
-            # Best-effort, never blocks the run: a transient disk issue must not silently disable the curator forever.
+    fence = None
+    fence_owned = False
+    operation = None
+    try:
+        if dry_run:  # count candidates without mutating state
+            counts = {"checked": len(_safe_curated_report()), "marked_stale": 0, "archived": 0, "reactivated": 0}
+        else:
+            fence = post_write.acquire_operation_fence()
             try:
-                snap = curator_backup.snapshot_skills(reason="pre-curator-run")
-                if snap is not None:
-                    _notify(on_summary, f"curator: snapshot created ({snap.name})")
-            except Exception as e:
-                logger.debug("Curator pre-run snapshot failed: %s", e, exc_info=True)
-        else:
-            with contextlib.suppress(Exception):
-                curator_backup.prune_old_snapshots()
-        counts = apply_automatic_transitions(now=start)
-    auto_summary = ", ".join(
-        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated")) if counts[key]
-    ) or "no changes"
+                fence.__enter__()
+            except post_write.FenceBusy:
+                logger.info("curator deferred: self-improvement operation fence busy")
+                return {"started_at": start.isoformat(), "deferred": "self-improvement fence busy"}
+            fence_owned = True
+            operation = post_write.begin_operation("curator")
+            from agent import curator_backup
+            # Preserve the baseline's snapshot policy: only consolidation takes a
+            # whole-tree snapshot; prune-only runs still age out old snapshots.
+            if consolidate:
+                try:
+                    snap = curator_backup.snapshot_skills(reason="pre-curator-run")
+                    if snap is not None:
+                        _notify(on_summary, f"curator: snapshot created ({snap.name})")
+                except Exception as e:
+                    logger.debug("Curator pre-run snapshot failed: %s", e, exc_info=True)
+            else:
+                with contextlib.suppress(Exception):
+                    curator_backup.prune_old_snapshots()
+            counts = apply_automatic_transitions(now=start)
+        auto_summary = ", ".join(
+            f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated")) if counts[key]
+        ) or "no changes"
 
-    # Persist before the LLM pass so a crash mid-review still records the run.
-    # Dry-run does NOT bump last_run_at/run_count (a preview must not push the
-    # next real pass out) but still records a summary for `hermes curator status`.
-    prefix = "dry-run auto: " if dry_run else "auto: "
-    state = {**load_state(), "last_run_summary": f"{prefix}{auto_summary}"}
-    if not dry_run:
-        state.update(last_run_at=start.isoformat(), run_count=int(state.get("run_count", 0)) + 1)
-    save_state(state)
-
-    def _llm_pass():
-        # Snapshot skill state BEFORE the LLM pass so the report can diff.
-        before_report = _safe_curated_report()
-        before_names = set(_by_name(before_report))
-        if consolidate:
-            final_summary, llm_meta = _consolidation_pass(prefix, auto_summary, dry_run, before_names)
-        else:
-            # Prune-only run: record it and write a report, but never fork.
-            final_summary = f"{prefix}{auto_summary}; llm: skipped (consolidation off)"
-            llm_meta = _llm_meta("skipped (consolidation off)")
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        state2 = {**load_state(), "last_run_duration_seconds": elapsed, "last_run_summary": final_summary}
-        # Per-run report, best-effort; path recorded for `hermes curator status`.
-        try:
-            report_path = _write_run_report(
-                started_at=start, elapsed_seconds=elapsed, auto_counts=counts, auto_summary=auto_summary,
-                before_report=before_report, before_names=before_names, after_report=_safe_curated_report(), llm_meta=llm_meta,
+        # Record the scheduler run before the optional fork. A dry run leaves
+        # the scheduler clock alone and never enters the validation fence.
+        prefix = "dry-run auto: " if dry_run else "auto: "
+        state = {**load_state(), "last_run_summary": f"{prefix}{auto_summary}"}
+        if operation is not None:
+            state.update(
+                last_run_at=start.isoformat(), run_count=int(state.get("run_count", 0)) + 1,
+                last_run_summary=f"{prefix}{auto_summary}; validation pending",
+                last_gate_state=post_write.GateState.PENDING.value,
+                last_gate_operation_id=operation.operation_id,
+                last_gate_started_at=operation.started_at,
+                last_gate_completed_at=None, last_gate_result=None,
             )
-            if report_path is not None:
-                state2["last_report_path"] = str(report_path)
-        except Exception as e:
-            logger.debug("Curator report write failed: %s", e, exc_info=True)
-        save_state(state2)
-        _notify(on_summary, f"curator: {final_summary}")
+        save_state(state)
 
-    if synchronous:
-        _llm_pass()
-    else:
-        threading.Thread(target=_llm_pass, daemon=True, name="curator-review").start()
-    return {"started_at": start.isoformat(), "auto_transitions": counts, "summary_so_far": auto_summary}
+        def _llm_pass():
+            final_summary = f"{prefix}{auto_summary}"
+            llm_meta: Dict[str, Any] = {}
+            failure = None
+            interrupted = False
+            try:
+                before_report = _safe_curated_report()
+                before_names = set(_by_name(before_report))
+                if consolidate:
+                    final_summary, llm_meta = _consolidation_pass(prefix, auto_summary, dry_run, before_names)
+                else:
+                    final_summary = f"{prefix}{auto_summary}; llm: skipped (consolidation off)"
+                    llm_meta = _llm_meta("skipped (consolidation off)")
+                failure = llm_meta.get("error")
+                if operation is not None:
+                    operation.session_id = llm_meta.get("session_id")
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+                state2 = {**load_state(), "last_run_duration_seconds": elapsed,
+                          "last_run_summary": final_summary + ("; validation pending" if operation else "")}
+                try:
+                    report_path = _write_run_report(
+                        started_at=start, elapsed_seconds=elapsed, auto_counts=counts, auto_summary=auto_summary,
+                        before_report=before_report, before_names=before_names, after_report=_safe_curated_report(),
+                        llm_meta=llm_meta,
+                    )
+                    if report_path is not None:
+                        state2["last_report_path"] = str(report_path)
+                except Exception as e:
+                    logger.debug("Curator report write failed: %s", e, exc_info=True)
+                save_state(state2)
+            except BaseException as exc:
+                failure = str(exc) or type(exc).__name__
+                interrupted = isinstance(exc, (KeyboardInterrupt, SystemExit))
+                raise
+            finally:
+                if operation is not None:
+                    try:
+                        gate_state = post_write.finish_operation(
+                            operation, interrupted=interrupted, failure=failure,
+                        )
+                        if operation.persistence_error is None:
+                            mirror = load_state()
+                            mirror["last_run_summary"] = final_summary + (
+                                "; validation passed" if gate_state == post_write.GateState.PASS else
+                                "; validation not applicable" if gate_state == post_write.GateState.NOT_APPLICABLE else
+                                f"; validation {gate_state.value}"
+                            )
+                            save_state(mirror)
+                        if gate_state in (post_write.GateState.FINDINGS, post_write.GateState.OPERATIONAL_ERROR,
+                                          post_write.GateState.INTERRUPTED):
+                            detail = "; ".join(
+                                f"{result.validator_name or 'gate'}: {result.reason or result.state.value}"
+                                + (f" ({result.artifact_path})" if result.artifact_path else "")
+                                for result in operation.results
+                            )
+                            _notify(on_summary, f"curator: validation {gate_state.value}: {detail}")
+                        else:
+                            _notify(on_summary, f"curator: {final_summary}; validation "
+                                    f"{'passed' if gate_state == post_write.GateState.PASS else 'not applicable'}")
+                    finally:
+                        fence.__exit__(None, None, None)
+                else:
+                    _notify(on_summary, f"curator: {final_summary}")
+
+        if synchronous:
+            fence_owned = False if operation is not None else fence_owned
+            _llm_pass()
+        else:
+            from tools.thread_context import propagate_context_to_thread
+            worker = threading.Thread(
+                target=propagate_context_to_thread(_llm_pass), daemon=True, name="curator-review",
+            )
+            worker.start()
+            fence_owned = False if operation is not None else fence_owned
+        return {"started_at": start.isoformat(), "auto_transitions": counts, "summary_so_far": auto_summary}
+    except BaseException as exc:
+        if operation is not None and fence_owned:
+            post_write.finish_operation(
+                operation, interrupted=isinstance(exc, (KeyboardInterrupt, SystemExit)),
+                failure=str(exc) or type(exc).__name__,
+            )
+        raise
+    finally:
+        if fence_owned:
+            fence.__exit__(None, None, None)
 
 
 # --- Provider/model resolution for the review fork ---
@@ -1089,6 +1210,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             # Umbrella-building over hundreds of skills takes 50-100 API calls.
             max_iterations=9999,
             quiet_mode=True, platform="curator", skip_context_files=True, skip_memory=True,
+        )
+        result_meta["session_id"] = (
+            getattr(review_agent, "session_id", None)
+            if isinstance(getattr(review_agent, "session_id", None), str) else None
         )
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0
